@@ -1,0 +1,170 @@
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: immich-uploaddata-pv
+spec:
+  capacity:
+    storage: 5Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/mnt/immich-data"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: immich-uploaddata-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: immich-deployment
+  labels:
+    app: immich
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: immich
+  template:
+    metadata:
+      labels:
+        app: immich
+    spec:
+      initContainers:
+      - name: set-postgres-permissions
+        image: ghcr.io/tensorchord/cloudnative-pgvecto.rs:16.5-v0.3.0
+        command: ['sh', '-c', 'chown -R postgres:postgres /var/lib/postgresql/data']
+        securityContext:
+          runAsUser: 0 # Run as root to have permission to chown
+        volumeMounts:
+        - name: immich-uploaddata
+          mountPath: /var/lib/postgresql/data
+          subPath: immich-db
+      containers:
+      - name: immich-server
+        image: ghcr.io/immich-app/immich-server:release
+        ports:
+        - containerPort: 2283
+        env:
+        - name: DB_HOSTNAME
+          value: localhost
+        - name: DB_USERNAME
+          value: immich
+        - name: DB_PASSWORD
+          value: immich
+        - name: DB_DATABASE_NAME
+          value: immich
+        - name: REDIS_HOSTNAME
+          value: localhost
+        - name: UPLOAD_LOCATION
+          value: /uploaddata
+        volumeMounts:
+        - name: syncthing-data
+          mountPath: /photos
+          subPath: Photos
+        - name: immich-uploaddata
+          mountPath: /uploaddata
+
+      - name: postgres
+        image: ghcr.io/tensorchord/cloudnative-pgvecto.rs:16.5-v0.3.0
+        args:
+        - -c
+        - shared_preload_libraries=vectors.so
+        env:
+        - name: POSTGRES_USER
+          value: immich
+        - name: POSTGRES_PASSWORD
+          value: immich
+        - name: POSTGRES_DB
+          value: immich
+        - name: PGDATA
+          value: /var/lib/postgresql/data
+        volumeMounts:
+        - name: immich-uploaddata
+          mountPath: /var/lib/postgresql/data
+          subPath: immich-db
+        - name: db-init-script
+          mountPath: /docker-entrypoint-initdb.d/init.sql
+          subPath: init.sql
+          readOnly: true
+
+      - name: redis
+        image: redis:6.2-alpine
+        ports:
+        - containerPort: 6379
+
+      volumes:
+      - name: syncthing-data
+        persistentVolumeClaim:
+          claimName: syncthing-data-pvc
+      - name: immich-uploaddata
+        persistentVolumeClaim:
+          claimName: immich-uploaddata-pvc
+      - name: db-init-script
+        configMap:
+          name: immich-db-init-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: immich-svc
+spec:
+  type: NodePort
+  selector:
+    app: immich
+  ports:
+  - protocol: TCP
+    port: 2283 
+    targetPort: 2283
+    nodePort: 32283
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: immich-machine-learning-deployment
+  labels:
+    app: immich-machine-learning
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: immich-machine-learning
+  template:
+    metadata:
+      labels:
+        app: immich-machine-learning
+    spec:
+      containers:
+        - name: immich-machine-learning
+          image: ghcr.io/immich-app/immich-machine-learning:release
+          ports:
+            - containerPort: 3003
+              name: http
+          volumeMounts:
+            - name: model-cache
+              mountPath: /cache
+      volumes:
+        - name: model-cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: immich-machine-learning
+spec:
+  type: ClusterIP
+  selector:
+    app: immich-machine-learning
+  ports:
+    - protocol: TCP
+      port: 3003 
+      targetPort: 3003

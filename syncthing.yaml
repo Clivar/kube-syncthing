@@ -1,0 +1,307 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: syncthing-config-pv
+spec:
+  capacity:
+    storage: 1Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/mnt/syncthing-config"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: syncthing-config-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: syncthing-data-pv
+spec:
+  capacity:
+    storage: 10Gi # Adjust size as needed
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  hostPath:
+    path: "/mnt/syncthing-data"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: syncthing-data-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi # Adjust size as needed
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: syncthing-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: syncthing
+  template:
+    metadata:
+      labels:
+        app: syncthing
+    spec:
+      initContainers:
+        - name: borg-restore
+          image: b3vis/borgmatic:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              if [ -z "$(ls -A /config)" ]; then
+                echo "Syncthing config is empty. Restoring from backup..."
+                mkdir -p ~/.ssh
+                cp /etc/borg-ssh/id_rsa ~/.ssh/id_rsa
+                cp /etc/borg-ssh/known_hosts ~/.ssh/known_hosts
+                chmod 700 ~/.ssh
+                chmod 600 ~/.ssh/id_rsa
+                chmod 644 ~/.ssh/known_hosts
+                borg extract --list $BORG_REPO::config /config
+              else
+                echo "Syncthing config found. Skipping restore."
+              fi
+          env:
+            - name: BORG_REPO
+              valueFrom:
+                secretKeyRef:
+                  name: borg-credentials
+                  key: BORG_REPO
+            - name: BORG_PASSPHRASE
+              valueFrom:
+                secretKeyRef:
+                  name: borg-credentials
+                  key: BORG_PASSPHRASE
+          volumeMounts:
+            - name: borg-ssh-key
+              mountPath: "/etc/borg-ssh"
+              readOnly: true
+            - name: syncthing-config
+              mountPath: /config
+      containers:
+        - name: syncthing
+          image: syncthing/syncthing:latest
+          ports:
+            - containerPort: 8384
+              name: gui
+            - containerPort: 22000
+              name: sync-tcp
+            - containerPort: 21027
+              name: sync-udp
+              protocol: UDP
+          volumeMounts:
+            - name: syncthing-config
+              mountPath: /var/syncthing/config
+            - name: syncthing-data
+              mountPath: /var/syncthing/data
+      volumes:
+        - name: borg-ssh-key
+          secret:
+            secretName: borg-ssh-secret
+        - name: syncthing-config
+          persistentVolumeClaim:
+            claimName: syncthing-config-pvc
+        - name: syncthing-data
+          persistentVolumeClaim:
+            claimName: syncthing-data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: syncthing-service
+spec:
+  type: NodePort
+  selector:
+    app: syncthing
+  ports:
+    - name: sync-tcp
+      port: 22000
+      targetPort: 22000
+      nodePort: 32200
+    - name: sync-udp
+      port: 21027
+      targetPort: 21027
+      protocol: UDP
+      nodePort: 31027
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: borg-backup-cron
+spec:
+  schedule: "0 2 * * *" # Runs daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: borg-backup
+              image: b3vis/borgmatic:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  mkdir -p ~/.ssh
+                  cp /etc/borg-ssh/id_rsa ~/.ssh/id_rsa
+                  cp /etc/borg-ssh/known_hosts ~/.ssh/known_hosts
+                  chmod 700 ~/.ssh
+                  chmod 600 ~/.ssh/id_rsa
+                  chmod 644 ~/.ssh/known_hosts
+                  borg create --stats --compression lz4 --list $BORG_REPO::'data-{now:%Y-%m-%d_%H:%M:%S}' /data
+                  borg prune --list --keep-daily=7 --keep-weekly=4 --keep-monthly=6 $BORG_REPO --prefix 'data-'
+                  curl -fsS -m 10 --retry 5 $HEALTHCHECK_URL
+              env:
+                - name: BORG_REPO
+                  valueFrom:
+                    secretKeyRef:
+                      name: borg-credentials
+                      key: BORG_REPO
+                - name: BORG_PASSPHRASE
+                  valueFrom:
+                    secretKeyRef:
+                      name: borg-credentials
+                      key: BORG_PASSPHRASE
+                - name: HEALTHCHECK_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: borg-credentials
+                      key: HEALTHCHECKS_DATA_URL
+              volumeMounts:
+                - name: borg-ssh-key
+                  mountPath: "/etc/borg-ssh"
+                  readOnly: true
+                - name: syncthing-data
+                  mountPath: /data
+                  readOnly: true
+          restartPolicy: OnFailure
+          volumes:
+            - name: borg-ssh-key
+              secret:
+                secretName: borg-ssh-secret
+            - name: syncthing-data
+              persistentVolumeClaim:
+                claimName: syncthing-data-pvc
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: borg-backup-config-cron
+spec:
+  schedule: "0 1 * * *" # Runs daily at 1 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: borg-backup-config
+              image: b3vis/borgmatic:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  echo "Starting config backup..."
+                  mkdir -p ~/.ssh
+                  cp /etc/borg-ssh/id_rsa ~/.ssh/id_rsa
+                  cp /etc/borg-ssh/known_hosts ~/.ssh/known_hosts
+                  chmod 700 ~/.ssh
+                  chmod 600 ~/.ssh/id_rsa
+                  chmod 644 ~/.ssh/known_hosts
+                  borg create --stats --compression lz4 --list $BORG_REPO::'config-{now:%Y-%m-%d_%H:%M:%S}' /config
+                  echo "Pruning old config backups..."
+                  borg prune --list --keep-daily=7 --keep-weekly=4 --keep-monthly=6 $BORG_REPO --prefix 'config-'
+                  curl -fsS -m 10 --retry 5 $HEALTHCHECK_URL
+              env:
+                - name: BORG_REPO
+                  valueFrom:
+                    secretKeyRef:
+                      name: borg-credentials
+                      key: BORG_REPO
+                - name: BORG_PASSPHRASE
+                  valueFrom:
+                    secretKeyRef:
+                      name: borg-credentials
+                      key: BORG_PASSPHRASE
+                - name: HEALTHCHECK_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: borg-credentials
+                      key: HEALTHCHECKS_CONFIG_URL
+              volumeMounts:
+                - name: borg-ssh-key
+                  mountPath: "/etc/borg-ssh"
+                  readOnly: true
+                - name: syncthing-config
+                  mountPath: /config
+                  readOnly: true
+          restartPolicy: OnFailure
+          volumes:
+            - name: borg-ssh-key
+              secret:
+                secretName: borg-ssh-secret
+            - name: syncthing-config
+              persistentVolumeClaim:
+                claimName: syncthing-config-pvc
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: borg-test-job
+spec:
+  template:
+    spec:
+      containers:
+        - name: borg-init
+          image: b3vis/borgmatic:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              mkdir -p ~/.ssh
+              cp /etc/borg-ssh/id_rsa ~/.ssh/id_rsa
+              cp /etc/borg-ssh/known_hosts ~/.ssh/known_hosts
+              chmod 700 ~/.ssh
+              chmod 600 ~/.ssh/id_rsa
+              chmod 644 ~/.ssh/known_hosts
+              borg init --encryption=repokey-blake2
+          env:
+            - name: BORG_REPO
+              valueFrom:
+                secretKeyRef:
+                  name: borg-credentials
+                  key: BORG_REPO
+            - name: BORG_PASSPHRASE
+              valueFrom:
+                secretKeyRef:
+                  name: borg-credentials
+                  key: BORG_PASSPHRASE
+          volumeMounts:
+            - name: borg-ssh-key
+              mountPath: "/etc/borg-ssh"
+              readOnly: true
+      restartPolicy: Never
+      volumes:
+        - name: borg-ssh-key
+          secret:
+            secretName: borg-ssh-secret
+  backoffLimit: 2
