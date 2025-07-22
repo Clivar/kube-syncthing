@@ -1,0 +1,44 @@
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: borg-test-job
+spec:
+  template:
+    spec:
+      containers:
+        - name: borg-init
+          image: b3vis/borgmatic:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              mkdir -p ~/.ssh
+              cp /etc/borg-ssh/id_rsa ~/.ssh/id_rsa
+              cp /etc/borg-ssh/known_hosts ~/.ssh/known_hosts
+              chmod 700 ~/.ssh
+              chmod 600 ~/.ssh/id_rsa
+              chmod 644 ~/.ssh/known_hosts
+              borg init --encryption=repokey-blake2
+          env:
+            - name: BORG_REPO
+              valueFrom:
+                secretKeyRef:
+                  name: borg-credentials
+                  key: BORG_REPO
+            - name: BORG_PASSPHRASE
+              valueFrom:
+                secretKeyRef:
+                  name: borg-credentials
+                  key: BORG_PASSPHRASE
+          volumeMounts:
+            - name: borg-ssh-key
+              mountPath: "/etc/borg-ssh"
+              readOnly: true
+      restartPolicy: Never
+      volumes:
+        - name: borg-ssh-key
+          secret:
+            secretName: borg-ssh-secret
+  backoffLimit: 2
