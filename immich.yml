@@ -10,12 +10,36 @@ spec:
   accessModes:
     - ReadWriteOnce
   hostPath:
-    path: "/mnt/immich-data"
+    path: "/mnt/immich-uploaddata"
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: immich-uploaddata-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: immich-db-pv
+spec:
+  capacity:
+    storage: 5Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/mnt/immich-db"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: immich-db-pvc
 spec:
   accessModes:
     - ReadWriteOnce
@@ -44,11 +68,10 @@ spec:
         image: ghcr.io/tensorchord/cloudnative-pgvecto.rs:16.5-v0.3.0
         command: ['sh', '-c', 'chown -R postgres:postgres /var/lib/postgresql/data']
         securityContext:
-          runAsUser: 0 # Run as root to have permission to chown
+          runAsUser: 0
         volumeMounts:
-        - name: immich-uploaddata
+        - name: immich-db
           mountPath: /var/lib/postgresql/data
-          subPath: immich-db
       containers:
       - name: immich-server
         image: ghcr.io/immich-app/immich-server:release
@@ -89,9 +112,8 @@ spec:
         - name: PGDATA
           value: /var/lib/postgresql/data
         volumeMounts:
-        - name: immich-uploaddata
+        - name: immich-db
           mountPath: /var/lib/postgresql/data
-          subPath: immich-db
         - name: db-init-script
           mountPath: /docker-entrypoint-initdb.d/init.sql
           subPath: init.sql
@@ -109,6 +131,9 @@ spec:
       - name: immich-uploaddata
         persistentVolumeClaim:
           claimName: immich-uploaddata-pvc
+      - name: immich-db
+        persistentVolumeClaim:
+          claimName: immich-db-pvc
       - name: db-init-script
         configMap:
           name: immich-db-init-script
